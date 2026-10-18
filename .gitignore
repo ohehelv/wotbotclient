@@ -1,0 +1,5 @@
+*.pyc
+!release/**/*.pyc
+__pycache__/
+sandbox_launch.txt
+tests/sandbox_launch.txt
