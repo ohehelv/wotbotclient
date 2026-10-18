@@ -17,7 +17,7 @@ log = S.log
 logExc = S.logExc
 V3 = S.V3
 
-VERSION = 'native-0.2'
+VERSION = 'native-0.3'
 
 
 class _Stub(object):
@@ -311,6 +311,9 @@ class NativeServer(object):
         VEHICLE_DEFAULTS['arenaTypeID'] = arenaType.id
         _setClassDefaults(Avatar.PlayerAvatar, AVATAR_DEFAULTS)
         _setClassDefaults(Vehicle.Vehicle, VEHICLE_DEFAULTS)
+        # 'ownVehicle' is a server-created dynamic component of the player's vehicle; stand in with a no-op stub
+        if not hasattr(Vehicle.Vehicle, 'ownVehicle'):
+            Vehicle.Vehicle.ownVehicle = _Stub()
         # space
         BigWorld.clearAllSpaces()
         BigWorld.worldDrawEnabled(False)
@@ -687,11 +690,15 @@ class NativeServer(object):
                 if v['alive']:
                     b.tick(dt)
                 ent = BigWorld.entities.get(vid)
-                if ent is None:
+                if ent is None or not getattr(ent, 'isStarted', False):
                     continue
                 f = getattr(ent, 'filter', None)
                 try:
-                    if f is not None and hasattr(f, 'input'):
+                    if isinstance(f, BigWorld.WGVehicleFilter):
+                        if not v.get('filterLogged'):
+                            v['filterLogged'] = True
+                            log('native: feeding WGVehicleFilter of', vid)
+                        f.reset()
                         f.input(BigWorld.time(), self.spaceID, 0, b.pos, (0, 0, 0), (b.roll, b.pitch, b.yaw))
                 except Exception:
                     if not v.get('filterErr'):
