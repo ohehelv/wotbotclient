@@ -1881,6 +1881,45 @@ def _patchInput():
     _gameModule.handleMouseEvent = handleMouseEvent
 
 
+def _installNative():
+    """Native mode: let the game start normally (no server connection allowed), then hand it a battle."""
+    def blockedConnect(*args, **kwargs):
+        log('native: BigWorld.connect blocked (offline sandbox)')
+        return None
+    BigWorld.connect = blockedConnect
+    try:
+        from helpers import dependency
+        from skeletons.connection_mgr import IConnectionManager
+
+        def blockConnMgr():
+            try:
+                mgr = dependency.instance(IConnectionManager)
+                mgr.connect = lambda *a, **k: log('native: connectionMgr.connect blocked')
+                mgr.initiateConnection = lambda *a, **k: log('native: initiateConnection blocked')
+                log('native: connection manager blocked')
+            except Exception:
+                logExc('block connection manager')
+        BigWorld.callback(0.0, blockConnMgr)
+    except Exception:
+        logExc('native connection block')
+    import game as _gameModule
+    _origStart = _gameModule.start
+
+    def start():
+        _origStart()
+        delay = float(g_cfg.get('nativedelay', 4.0))
+        log('native: game started, launching battle in', delay, 's')
+
+        def go():
+            try:
+                from gui.mods import sandbox_native
+                sandbox_native.start(g_cfg)
+            except Exception:
+                logExc('native start')
+        BigWorld.callback(delay, go)
+    _gameModule.start = start
+
+
 def init():
     global g_cfg
     if not _isSandboxLaunch():
@@ -1888,6 +1927,10 @@ def init():
     try:
         g_cfg = _parseArgs()
         log('sandbox launch detected, argv =', sys.argv, 'flag =', _flagArgs, 'cfg =', g_cfg)
+        if g_cfg.get('mode') == 'native':
+            _installNative()
+            log('native hooks installed')
+            return
         from helpers import OfflineMode
         OfflineMode.onStartup = _onStartup
         if g_cfg.get('mode') != 'freecam':
