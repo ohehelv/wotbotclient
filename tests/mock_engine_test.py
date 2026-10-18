@@ -66,6 +66,15 @@ class Matrix(object):
     def applyVector(self, p):
         p = Vector3(p); m = self.m
         return Vector3(*[p.x*m[0][j]+p.y*m[1][j]+p.z*m[2][j] for j in range(3)])
+    @property
+    def yaw(self):
+        z = self.applyToAxis(2); return math.atan2(z.x, z.z)
+    @property
+    def pitch(self):
+        z = self.applyToAxis(2); return -math.asin(max(-1.0, min(1.0, z.y)))
+    @property
+    def roll(self):
+        return 0.0
     def applyToAxis(self, i): return Vector3(self.m[i][0], self.m[i][1], self.m[i][2])
     def invert(self):
         # rigid inverse
@@ -172,6 +181,7 @@ class Servo(object):
     def __init__(s, m): s.signal = m
 BW.Servo = Servo
 BW.addModel = lambda m, s: None
+BW.delModel = lambda m: None
 _keys = set()
 BW.isKeyDown = lambda k: k in _keys
 BW.quit = lambda: None

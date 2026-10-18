@@ -13,7 +13,7 @@ import Math
 import GUI
 import Keys
 
-VERSION = '0.4'
+VERSION = '0.5'
 _TAG = '[SANDBOX]'
 
 DEFAULTS = {
@@ -27,6 +27,7 @@ DEFAULTS = {
     'pen': '0.95',
     'repairs': '3',
     'repairhp': '0.4',
+    'tracks': '1',
 }
 BOT_POOL = [
     'ussr:R04_T-34', 'ussr:R07_T-34-85', 'ussr:R05_KV', 'ussr:R01_IS',
@@ -157,21 +158,238 @@ def staticEffects():
     return _staticEffects
 
 
-def playEffectAt(effectsDescr, keys, position, direction):
+_effectStats = {'ok': 0, 'fail': 0}
+_effectModels = []
+
+
+def _effectModel(spaceID, position, direction):
+    try:
+        import helpers
+        model = helpers.newFakeModel()
+    except Exception:
+        model = BigWorld.Model('')
+    BigWorld.addModel(model, spaceID)
+    model.position = position
+    try:
+        if direction is not None:
+            model.rotate(direction.yaw, (0.0, 1.0, 0.0))
+    except Exception:
+        pass
+    return model
+
+
+def playEffectAt(effectsDescr, keys, position, direction, spaceID=None):
+    """Plays a shot effect timeline at a world position on a standalone world model."""
     if effectsDescr is None:
-        return
+        return False
+    if spaceID is None:
+        spaceID = g_game.spaceID if g_game is not None else BigWorld.camera().spaceID
     for key in keys:
+        item = effectsDescr.get(key) if hasattr(effectsDescr, 'get') else None
+        if not item:
+            continue
         try:
-            item = effectsDescr.get(key) if hasattr(effectsDescr, 'get') else None
-            if not item:
-                continue
-            keyPoints, effects, _ = item
-            staticEffects().addNew(position, effects, keyPoints, None, dir=direction,
-                                   start=position - direction, end=position + direction, attackerID=0)
-            return
+            keyPoints, effects = item[0], item[1]
+            from helpers.EffectsList import EffectsListPlayer
+            model = _effectModel(spaceID, position, direction)
+            holder = {}
+
+            def onStop(*args):
+                try:
+                    BigWorld.delModel(holder['model'])
+                except Exception:
+                    pass
+                try:
+                    _effectModels.remove(holder['model'])
+                except Exception:
+                    pass
+            holder['model'] = model
+            _effectModels.append(model)
+            player = EffectsListPlayer(effects, keyPoints, dir=direction, start=position - direction,
+                                       end=position + direction, attackerID=0, entity_id=0)
+            player.play(model, None, onStop)
+            holder['player'] = player
+            _effectStats['ok'] += 1
+            if _effectStats['ok'] in (1, 10, 100):
+                log('effects played:', _effectStats['ok'], 'last key', key)
+            return True
         except Exception:
-            logExc('playEffectAt ' + key)
+            _effectStats['fail'] += 1
+            if _effectStats['fail'] <= 5:
+                logExc('playEffectAt ' + key)
+            # fallback: built-in static scene effects
+            try:
+                keyPoints, effects = item[0], item[1]
+                staticEffects().addNew(position, effects, keyPoints, None, dir=direction,
+                                       start=position - direction, end=position + direction, attackerID=0)
+                return True
+            except Exception:
+                if _effectStats['fail'] <= 5:
+                    logExc('playEffectAt fallback ' + key)
+            return False
+    return False
+
+
+# --------------------------------------------------------------------------- floating 3D text
+class FloatText(object):
+
+    def __init__(self, spaceID, position, text, colour, life=1.6, size=1.2):
+        self.pos = Math.Vector3(position)
+        self.life = life
+        self.total = life
+        self.colour = colour
+        self.alive = True
+        try:
+            att = GUI.Attachment()
+            comp = GUI.Text(uni(text))
+            att.component = comp
+            att.faceCamera = True
+            comp.visible = True
+            comp.explicitSize = True
+            comp.filterType = GUI.Simple.eFilterType.LINEAR
+            comp.verticalAnchor = GUI.Simple.eVAnchor.BOTTOM
+            comp.size = (0, size)
+            comp.colour = colour
+            self.mat = Math.Matrix()
+            self.mat.setTranslate(self.pos)
+            self.servo = BigWorld.Servo(self.mat)
+            self.model = BigWorld.Model('')
+            self.model.addMotor(self.servo)
+            BigWorld.addModel(self.model, spaceID)
+            self.model.root.attach(att)
+            self.comp = comp
+        except Exception:
+            logExc('FloatText')
+            self.alive = False
+            self.model = None
+
+    def tick(self, dt):
+        if not self.alive:
             return
+        self.life -= dt
+        if self.life <= 0:
+            self.destroy()
+            return
+        self.pos.y += dt * 1.5
+        self.mat.setTranslate(self.pos)
+        self.servo.signal = self.mat
+        a = int(255 * min(1.0, self.life / (self.total * 0.5)))
+        try:
+            self.comp.colour = (self.colour[0], self.colour[1], self.colour[2], a)
+        except Exception:
+            pass
+
+    def destroy(self):
+        self.alive = False
+        if self.model is not None:
+            try:
+                BigWorld.delModel(self.model)
+            except Exception:
+                pass
+            self.model = None
+
+
+# --------------------------------------------------------------------------- tracks (experimental)
+class TrackRig(object):
+    """Animated tracks/wheels, the same way the kill-cam drives client-only vehicles:
+    CGF game object + WGVehicleFilter + model_assembler track components + PyTrackScroll.setExternal."""
+
+    def __init__(self, tank, refs):
+        self.tank = tank
+        self.ok = False
+        self.scrollCtl = None
+        self.filter = None
+        self.steps = []
+        d = tank.vDesc
+        sid = tank.game.spaceID
+        self.typeDescriptor = d
+        self.compoundModel = tank.model
+        self.id = tank.entityID
+        self.fashion = tank.fashions[0] if getattr(tank, 'fashions', None) else None
+        self.splineTracks = None
+        import CGF
+        from vehicle_systems import model_assembler as ma
+        queue = CGF.CommandQueue(sid)
+        ent = BigWorld.entities.get(tank.entityID)
+
+        def step(name, fn):
+            try:
+                r = fn()
+                self.steps.append(name + ':ok')
+                return r
+            except Exception:
+                self.steps.append(name + ':FAIL')
+                logExc('TrackRig.' + name + ' ' + tank.typeName)
+                return None
+
+        def mkGo():
+            go = queue.createGameObject('SandboxTank_%d' % tank.entityID)
+            parent = getattr(ent, 'entityGameObject', None)
+            if parent is not None:
+                queue.createComponent(go, CGF.HierarchyComponent, parent)
+            else:
+                queue.createComponent(go, CGF.HierarchyComponent)
+            queue.createComponent(go, CGF.TransformComponent, Math.Matrix())
+            return go
+        self.gameObject = step('gameObject', mkGo)
+        if self.gameObject is None:
+            return
+        self.filter = step('filter', lambda: ma.createVehicleFilter(d))
+        if self.filter is not None and ent is not None:
+            step('entityFilter', lambda: setattr(ent, 'filter', self.filter))
+        self.splineTracks = step('splineTracks', lambda: ma.setupSplineTracks(self.fashion, d, tank.model, refs, ''))
+        try:
+            from vehicle_systems.tankStructure import ColliderTypes
+            collider = ColliderTypes.VEHICLE_COLLIDER
+        except Exception:
+            collider = 0
+        step('wheels', lambda: ma.createWheelsAnimator(self, collider, d, (lambda: 0), self.splineTracks, queue))
+        step('trackNodes', lambda: ma.createTrackNodesAnimator(self, d, queue))
+        step('tracks', lambda: ma.assembleTracks(refs, d, self, self.splineTracks, True, queue))
+
+        def mkScroll():
+            sc = BigWorld.PyTrackScroll()
+            sc.activate()
+            if self.filter is not None:
+                sc.setData(self.filter)
+            return sc
+        self.scrollCtl = step('trackScroll', mkScroll)
+        step('activate', lambda: self.gameObject.activate())
+        self.ok = self.scrollCtl is not None
+        log('TrackRig', tank.typeName, ' '.join(self.steps))
+
+    def update(self, pos, yaw, pitch, roll, speed, yawRate):
+        if self.filter is not None:
+            try:
+                self.filter.reset()
+                self.filter.input(BigWorld.time(), self.tank.game.spaceID, 0, pos, (0, 0, 0), (roll, pitch, yaw))
+            except Exception:
+                if 'filterInput' not in self.steps:
+                    self.steps.append('filterInput')
+                    logExc('TrackRig.filter.input')
+        if self.scrollCtl is not None:
+            half = self.tank.halfWid
+            left = speed + yawRate * half
+            right = speed - yawRate * half
+            try:
+                self.scrollCtl.setExternal(left, right)
+            except Exception:
+                if 'setExternal' not in self.steps:
+                    self.steps.append('setExternal')
+                    logExc('TrackRig.setExternal')
+
+    def destroy(self):
+        try:
+            if self.scrollCtl is not None:
+                self.scrollCtl.deactivate()
+        except Exception:
+            pass
+        try:
+            import CGF
+            CGF.CommandQueue(self.tank.game.spaceID).removeGameObject(self.gameObject)
+        except Exception:
+            pass
+        self.scrollCtl = None
 
 
 # --------------------------------------------------------------------------- shots
@@ -237,6 +455,8 @@ class Tank(object):
         self.turretMatrix = Math.Matrix()
         self.gunMatrix = Math.Matrix()
         self.entityID = None
+        self.trackRig = None
+        self.prevYaw = yaw
         self.model = None
         self.deadModel = None
         self.marker = None
@@ -364,6 +584,13 @@ class Tank(object):
                     resources += trackDesc.prerequisites('')
         except Exception:
             pass
+        if g_cfg.get('tracks', '1') != '0':
+            try:
+                for name, builders in self.vDesc.chassis.physicalTracks.items():
+                    for index, builder in enumerate(builders):
+                        resources.append(builder.createLoader(sid, '{0}{1}PhysicalTrack'.format(name, index), ''))
+            except Exception:
+                logExc('physicalTracks loaders')
         BigWorld.loadResourceListBG(tuple(resources), self.__onLoaded)
 
     def __onLoaded(self, refs):
@@ -389,6 +616,12 @@ class Tank(object):
                 tn.local = self.turretMatrix
             self.__updatePartMatrices()
             self.loaded = True
+            self.trackRig = None
+            if g_cfg.get('tracks', '1') != '0':
+                try:
+                    self.trackRig = TrackRig(self, refs)
+                except Exception:
+                    logExc('TrackRig')
             if not self.isPlayer:
                 self.__createMarker()
             log('loaded', self.typeName, 'team', self.team)
@@ -584,6 +817,11 @@ class Tank(object):
         if self.repairCooldown > 0:
             self.repairCooldown -= dt
         self.drive(dt)
+        if self.trackRig is not None and self.alive and dt > 0:
+            yawRate = angleDiff(self.yaw, self.prevYaw) / dt
+            m = self.matrix
+            self.trackRig.update(self.pos, m.yaw, m.pitch, m.roll, self.speed, yawRate)
+        self.prevYaw = self.yaw
         if self.marker is not None:
             m, servo, comp, mat = self.marker
             mat.setTranslate(self.pos + V3(0, self.height + 2.5, 0))
@@ -643,6 +881,8 @@ class Tank(object):
 
     def die(self):
         self.alive = False
+        if self.trackRig is not None:
+            self.trackRig.update(self.pos, self.yaw, 0, 0, 0, 0)
         try:
             ent = BigWorld.entities.get(self.entityID)
             if ent is not None and self.deadModel is not None:
@@ -661,6 +901,9 @@ class Tank(object):
         playEffectAt(self.shotEffects, ('armorHit', 'armorCriticalHit'), self.center(), V3(0, -1, 0))
 
     def destroy(self):
+        if self.trackRig is not None:
+            self.trackRig.destroy()
+            self.trackRig = None
         try:
             if self.marker is not None:
                 BigWorld.delModel(self.marker[0], self.game.spaceID) if hasattr(BigWorld, 'delModel') else None
@@ -754,7 +997,7 @@ class Shell(object):
                 self.model = BigWorld.Model(name)
                 self.servo = BigWorld.Servo(self.mat)
                 self.model.addMotor(self.servo)
-                BigWorld.player().addModel(self.model)
+                BigWorld.addModel(self.model, game.spaceID)
                 self.model.visible = True
                 self.effectsData = {}
                 try:
@@ -792,7 +1035,7 @@ class Shell(object):
         self.dead = True
         if self.model is not None:
             try:
-                BigWorld.player().delModel(self.model)
+                BigWorld.delModel(self.model)
             except Exception:
                 pass
             self.model = None
@@ -928,6 +1171,8 @@ class SandboxGame(object):
         self.defaultFov = math.radians(70)
         self.aimPoint = None
         self.fireRequested = False
+        self.hitTimers = {}
+        self.floats = []
 
     # ---------------- start
     def start(self):
@@ -1087,11 +1332,11 @@ class SandboxGame(object):
         self.brains.append(BotBrain(t, diff))
 
     # ---------------- GUI
-    def __text(self, key, x, y, size=None, colour=(255, 255, 255, 255), hAnchor='CENTER'):
+    def __text(self, key, x, y, size=None, colour=(255, 255, 255, 255), hAnchor='CENTER', vAnchor='CENTER'):
         t = GUI.Text('')
         t.multiline = True
         t.horizontalAnchor = getattr(GUI.Simple.eHAnchor, hAnchor)
-        t.verticalAnchor = GUI.Simple.eVAnchor.CENTER
+        t.verticalAnchor = getattr(GUI.Simple.eVAnchor, vAnchor)
         t.position = (x, y, 0.5)
         t.colour = colour
         GUI.addRoot(t)
@@ -1103,7 +1348,11 @@ class SandboxGame(object):
             self.__text('loading', 0, 0.1)
             self.__text('cross', 0, 0, colour=(255, 255, 255, 200)).text = u'+'
             self.__text('gunmark', 0, 0, colour=(120, 255, 120, 255)).text = 'o'
-            self.__text('hud', -0.97, -0.80, hAnchor='LEFT')
+            self.__text('hud', -0.97, -0.95, hAnchor='LEFT', vAnchor='BOTTOM')
+            self.__text('panel', 0, -0.95, vAnchor='BOTTOM', colour=(255, 255, 255, 255))
+            self.__text('reload', 0, -0.07, colour=(255, 255, 255, 230))
+            self.__text('hitinfo', 0, 0.14, colour=(255, 200, 80, 255))
+            self.__text('hurt', 0, -0.22, colour=(255, 80, 80, 255))
             self.__text('enemies', 0.97, 0.90, hAnchor='RIGHT')
             self.__text('msg', 0, 0.55, colour=(255, 230, 150, 255))
             self.__text('big', 0, 0.25, colour=(255, 255, 255, 255))
@@ -1117,6 +1366,17 @@ class SandboxGame(object):
         if t is not None:
             setText(t, s)
 
+    def flash(self, key, text, colour, life=1.5):
+        t = self.gui.get(key)
+        if t is None:
+            return
+        setText(t, text)
+        t.colour = colour
+        self.hitTimers[key] = life
+
+    def floatText(self, pos, text, colour):
+        self.floats.append(FloatText(self.spaceID, pos, text, colour))
+
     def addMessage(self, s, colour=(255, 230, 150, 255)):
         self.messages.append([s, 4.0, colour])
         self.messages = self.messages[-5:]
@@ -1129,17 +1389,36 @@ class SandboxGame(object):
         try:
             if p is not None:
                 rl = max(0.0, p.reloadLeft)
-                reload = 'ГОТОВ' if rl <= 0 else ('%.1f c' % rl)
-                ammo = '   '.join('%s[%d] %s %d' % ('>' if i == p.shotIdx else ' ', i + 1, sh.label, p.ammo[i])
-                                   for i, sh in enumerate(p.shots))
-                if p.ammo[p.shotIdx] <= 0:
-                    reload = 'НЕТ СНАРЯДОВ (1/2/3 - сменить)'
-                rk = '%d шт.' % p.repairKits
-                if p.repairCooldown > 0 and p.repairKits > 0:
-                    rk += ' (%d c)' % int(p.repairCooldown + 1)
-                setText(g['hud'], '%s\nПрочность: %d / %d\nПерезарядка: %s\nСнаряды: %s\nРемкомплект [4]: %s\nСкорость: %d км/ч\nСведение: %d%%\nУничтожено: %d' % (
-                    p.userName, int(p.hp), int(p.maxHp), reload, ammo, rk, int(abs(p.speed) * 3.6),
+                bars = 20
+                filled = int(round(bars * p.hp / max(p.maxHp, 1)))
+                hpBar = '|' * filled + '.' * (bars - filled)
+                setText(g['hud'], '%s\nПрочность: [%s] %d / %d\nСкорость: %d км/ч    Сведение: %d%%\nУничтожено: %d' % (
+                    p.userName, hpBar, int(p.hp), int(p.maxHp), int(abs(p.speed) * 3.6),
                     int(100.0 / p.dispersion), p.kills))
+                cells = []
+                for i, sh in enumerate(p.shots):
+                    cell = '%d: %s x%d' % (i + 1, sh.label, p.ammo[i])
+                    cells.append(('>> %s <<' % cell) if i == p.shotIdx else cell)
+                rkCell = '4: РЕМКОМПЛЕКТ x%d' % p.repairKits
+                if p.repairCooldown > 0 and p.repairKits > 0:
+                    rkCell += ' (%d c)' % int(p.repairCooldown + 1)
+                setText(g['panel'], 'СНАРЯДЫ:   ' + '     '.join(cells) + '          ' + rkCell)
+                if not p.alive:
+                    setText(g['reload'], '')
+                elif p.ammo[p.shotIdx] <= 0:
+                    setText(g['reload'], 'НЕТ СНАРЯДОВ - нажмите 1/2/3')
+                    g['reload'].colour = (255, 90, 90, 255)
+                elif rl > 0:
+                    setText(g['reload'], '%s  %.1f' % (p.shotInfo.label, rl))
+                    g['reload'].colour = (255, 170, 90, 255)
+                else:
+                    setText(g['reload'], '%s  ГОТОВ' % p.shotInfo.label)
+                    g['reload'].colour = (120, 255, 120, 255)
+            for key in ('hitinfo', 'hurt'):
+                left = self.hitTimers.get(key, 0) - dt
+                self.hitTimers[key] = left
+                if left <= 0 and key in g:
+                    setText(g[key], '')
                 g['gunmark'].colour = (120, 255, 120, 255) if p.canShoot() else (255, 120, 80, 255)
             alive = [t for t in self.tanks if t.team != self.playerTeam and t.alive]
             setText(g['enemies'], 'Врагов осталось: %d' % len(alive))
@@ -1302,9 +1581,10 @@ class SandboxGame(object):
         if ricochet:
             playEffectAt(info.effects, ('armorRicochet', 'armorBasicRicochet'), pos, dirv)
             if owner.isPlayer:
-                self.addMessage('Рикошет', (200, 200, 255, 255))
+                self.flash('hitinfo', 'РИКОШЕТ', (160, 190, 255, 255))
+                self.floatText(pos, 'Рикошет', (160, 190, 255, 255))
             elif target.isPlayer:
-                self.addMessage('Рикошет от вашей брони', (200, 200, 255, 255))
+                self.flash('hurt', 'Рикошет от вашей брони', (160, 190, 255, 255))
             return
         if armor <= 0 or pierce >= effective:
             dmg = info.damage * random.uniform(0.75, 1.25)
@@ -1317,16 +1597,19 @@ class SandboxGame(object):
         if dmg <= 0:
             playEffectAt(info.effects, ('armorResisted',), pos, dirv)
             if owner.isPlayer:
-                self.addMessage('Не пробил (%d мм)' % int(effective), (200, 200, 200, 255))
+                self.flash('hitinfo', 'НЕ ПРОБИЛ  (%d мм)' % int(effective), (200, 200, 200, 255))
+                self.floatText(pos, 'Не пробил', (200, 200, 200, 255))
             elif target.isPlayer:
-                self.addMessage('Броня выдержала', (150, 255, 150, 255))
+                self.flash('hurt', 'Броня выдержала', (150, 255, 150, 255))
             return
         playEffectAt(info.effects, ('armorHit', 'armorCriticalHit'), pos, dirv)
         killed = target.applyHit(dmg)
         if owner.isPlayer:
-            self.addMessage('Пробитие: -%d' % int(dmg), (255, 200, 80, 255))
+            self.flash('hitinfo', ('УНИЧТОЖЕН!  -%d' if killed else 'ПРОБИТИЕ  -%d') % int(dmg),
+                       (255, 80, 60, 255) if killed else (255, 200, 80, 255))
+            self.floatText(target.pos + V3(0, target.height + 1.0, 0), '-%d' % int(dmg), (255, 200, 60, 255))
         elif target.isPlayer:
-            self.addMessage('По вам: -%d (%s)' % (int(dmg), owner.userName), (255, 90, 90, 255))
+            self.flash('hurt', 'ПО ВАМ  -%d  (%s)' % (int(dmg), owner.userName), (255, 80, 80, 255))
         if killed:
             owner.kills += 1
             self.addMessage('%s уничтожен' % target.userName, (255, 120, 120, 255) if target.team != self.playerTeam else (255, 60, 60, 255))
@@ -1377,6 +1660,9 @@ class SandboxGame(object):
                 if (self.fireRequested or BigWorld.isKeyDown(Keys.KEY_LEFTMOUSE)) and self.state == 'play':
                     p.shoot()
             self.fireRequested = False
+            for f in self.floats:
+                f.tick(dt)
+            self.floats = [f for f in self.floats if f.alive]
             for s in self.shells:
                 s.tick(dt)
             self.shells = [s for s in self.shells if not s.dead]
