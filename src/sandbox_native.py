@@ -17,7 +17,100 @@ log = S.log
 logExc = S.logExc
 V3 = S.V3
 
-VERSION = 'native-0.1'
+VERSION = 'native-0.2'
+
+
+class _Stub(object):
+    """Falsy catch-all object returned for server-only config models that do not exist offline."""
+
+    def __getattr__(self, name):
+        if name.startswith('__'):
+            raise AttributeError(name)
+        return _Stub()
+
+    def __call__(self, *a, **k):
+        return _Stub()
+
+    def __nonzero__(self):
+        return False
+
+    __bool__ = __nonzero__
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 0
+
+    def __getitem__(self, k):
+        return _Stub()
+
+    def __int__(self):
+        return 0
+
+    def __float__(self):
+        return 0.0
+
+    def __eq__(self, o):
+        return isinstance(o, _Stub) or o in (None, False, 0)
+
+    def __ne__(self, o):
+        return not self.__eq__(o)
+
+    def __hash__(self):
+        return 0
+
+    def __repr__(self):
+        return '<SandboxStub>'
+
+
+def _patchServerSettings():
+    try:
+        from helpers import server_settings
+        cls = server_settings.ServerSettings
+        orig = cls.getConfigModel
+        missing = set()
+
+        def getConfigModel(self, schema):
+            try:
+                return orig(self, schema)
+            except Exception:
+                key = getattr(schema, 'gpKey', schema)
+                if key not in missing:
+                    missing.add(key)
+                    log('native: stub config model for', key)
+                return _Stub()
+        cls.getConfigModel = getConfigModel
+        log('native: ServerSettings.getConfigModel patched')
+    except Exception:
+        logExc('patch server settings')
+
+
+AVATAR_DEFAULTS = {
+    'name': 'Player', 'sessionID': 'sandbox', 'arenaUniqueID': 1, 'arenaTypeID': 0,
+    'arenaBonusType': 2, 'arenaGuiType': 2, 'arenaExtraData': {}, 'weatherPresetID': 0,
+    'denunciationsLeft': 0, 'clientCtx': '', 'tkillIsSuspected': False,
+    'team': 1, 'playerVehicleID': 0, 'isObserverBothTeams': False, 'observableTeamID': 0,
+    'isGunLocked': False, 'ownVehicleGear': 0, 'ownVehicleAuxPhysicsData': 0,
+    'ownVehicleHullAimingPitchPacked': 0, 'customizationDisplayType': 0,
+    'playLimits': {'curfew': 0, 'weeklyPlayLimit': 0, 'dailyPlayLimit': 0, 'sessionLimit': 0},
+    'battleChatRestriction': {'isBattleChatDisabled': False, 'restrictionReasonID': 0},
+    'goodiesSnapshot': [], 'shouldSendKillcamSimulationData': False,
+    'remoteCamera': {'time': 0.0, 'shotPoint': Math.Vector3(0, 0, 0), 'zoom': 0, 'mode': 0},
+    'isObserverFPV': False, 'numOfObservers': 0,
+}
+VEHICLE_DEFAULTS = {
+    'arenaTypeID': 0, 'arenaUniqueID': 1, 'arenaBonusType': 2,
+    'remoteCamera': {'time': 0.0, 'shotPoint': Math.Vector3(0, 0, 0), 'zoom': 0, 'mode': 0},
+}
+
+
+def _setClassDefaults(cls, values):
+    for k, v in values.items():
+        try:
+            setattr(cls, k, v)
+        except Exception:
+            logExc('class default %s.%s' % (cls.__name__, k))
 
 
 # --------------------------------------------------------------------------- mailboxes
@@ -166,6 +259,12 @@ class NativeServer(object):
             log('native: unhandled remote call', key, 'args', repr(args)[:200])
         return None
 
+    def rc_switchObserverFPV(self, owner, *args):
+        return None
+
+    def rc_bindToVehicle(self, owner, *args):
+        return None
+
     def rc_vehicle_moveWith(self, owner, flags):
         v = self.vehicles.get(self.ownVehID)
         if v is not None:
@@ -205,6 +304,13 @@ class NativeServer(object):
         bb = arenaType.boundingBox
         self.bounds = (bb[0][0], bb[0][1], bb[1][0], bb[1][1])
         _installMailboxes(self)
+        _patchServerSettings()
+        import Avatar
+        import Vehicle
+        AVATAR_DEFAULTS['arenaTypeID'] = arenaType.id
+        VEHICLE_DEFAULTS['arenaTypeID'] = arenaType.id
+        _setClassDefaults(Avatar.PlayerAvatar, AVATAR_DEFAULTS)
+        _setClassDefaults(Vehicle.Vehicle, VEHICLE_DEFAULTS)
         # space
         BigWorld.clearAllSpaces()
         BigWorld.worldDrawEnabled(False)
@@ -324,7 +430,7 @@ class NativeServer(object):
                 name = 'Player' if isPlayer else ('Bot_%d' % idx)
                 maxHealth = int(vDesc.maxHealth)
                 publicInfo = {'name': name, 'compDescr': compDescr, 'outfit': '', 'outfitLevel': 0,
-                              'index': idx, 'team': team, 'prebattleID': 0, 'marksOnGun': 0,
+                              'index': idx, 'team': team, 'prebattleID': 0, 'marksOnGun': 0, 'crewGroups': [],
                               'commanderSkinID': 0, 'maxHealth': maxHealth, 'respawnID': 0, 'stFrags': 0}
                 h = S.collideStatic(self.spaceID, V3(pos.x, 1000, pos.z), V3(pos.x, -500, pos.z))
                 pos = V3(pos.x, h.y if h is not None else 0, pos.z)
